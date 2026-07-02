@@ -1,4 +1,4 @@
-# EGATE-NNVQE paper code (Beta Release)
+# EGATE-NNVQE paper code
 
 Representative notebooks and helper scripts for "Improving Generalization and Trainability of Quantum Eigensolvers via Graph Neural Encoding"
 

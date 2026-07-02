@@ -6,17 +6,17 @@ import numpy as np
 
 def Energy(circuit, edges, edge_data, node_feats, compute_state=False):
     """
-    circuit: Qiskit 회로 (QuantumCircuit)
-    edges:   [(i, j), (k, l), ...] 형태의 엣지 리스트
-    edge_data: 각 엣지별 [J_xx, J_yy, J_zz] 값을 담은 리스트
-               edges와 동일한 순서로 정렬되어 있어야 함
+    circuit: Qiskit QuantumCircuit
+    edges:   [(i, j), (k, l), ...] edge list
+    edge_data: list of [J_xx, J_yy, J_zz] values for each edge
+               must be ordered the same way as edges
     """
-    n = circuit.num_qubits  # 회로에 사용되는 큐빗 수
+    n = circuit.num_qubits  # number of qubits used by the circuit
     coeffs = []
     paulis = []
     # K_x = node_feats[0][-1].item()
 
-    # 주어진 edges와 edge_data를 함께 순회
+    # Iterate over edges and edge_data together
     for (q1, q2), (J_xx, J_yy, J_zz) in zip(edges, edge_data):
         # X_q1 X_q2
         pauli_string = ['I'] * n
@@ -39,36 +39,25 @@ def Energy(circuit, edges, edge_data, node_feats, compute_state=False):
         paulis.append(Pauli(''.join(pauli_string)))
         coeffs.append(J_zz)
 
-    # for i in range(n):
-    #     s = ['I'] * n
-    #     s[i] = 'X'
-    #     paulis.append(Pauli(''.join(s)))
-    #     coeffs.append(K_x)
-
-
-    # 해밀토니안 구성
+    # Build the Hamiltonian
     H = SparsePauliOp(paulis, coeffs=coeffs)
-    # print(H)
-    # StatevectorEstimator를 이용해 기대값 계산
+    # Compute the expectation value with StatevectorEstimator
     estimator = StatevectorEstimator()
     if compute_state:
         state = Statevector.from_instruction(circuit)
         state_array = state.data
 
-        job = estimator.run([(circuit, H)])  # [(회로, 해밀토니안)] 형태
+        job = estimator.run([(circuit, H)])  # [(circuit, Hamiltonian)] format
         result = job.result()
-        energy = result[0].data.evs  # 기대값(에너지)
+        energy = result[0].data.evs  # expectation value (energy)
 
         return energy, state_array
     else:
-        job = estimator.run([(circuit, H)])  # [(회로, 해밀토니안)] 형태
+        job = estimator.run([(circuit, H)])  # [(circuit, Hamiltonian)] format
         result = job.result()
-        energy = result[0].data.evs  # 기대값(에너지)
+        energy = result[0].data.evs  # expectation value (energy)
         state_array = [0]
     return energy, state_array
-
-
-
     
 def HEA(inp, n, d=1, energy_flag=False, param_num=False):
     params = inp["params"]
@@ -122,15 +111,15 @@ def compute_gradients(params_np, edges, edge_data, node_feats, n, d):
         shifted_params_plus[i] += shift
         shifted_params_minus[i] -= shift
 
-        # 양자 회로 생성
+        # Build quantum circuit
         qc_plus = HEA({"params": shifted_params_plus, "edges": edges, "edge_data": edge_data, "node_feats": node_feats}, n, d)
         qc_minus = HEA({"params": shifted_params_minus, "edges": edges, "edge_data": edge_data, "node_feats": node_feats}, n, d)
 
-        # 에너지 계산
+        # Compute energy
         energy_plus, _ = Energy(qc_plus, edges, edge_data, node_feats)
         energy_minus, _ = Energy(qc_minus, edges, edge_data, node_feats)
 
-        # 기울기 계산
+        # Compute gradients
         grad_params[i] = 0.5 * (energy_plus - energy_minus)
 
     return grad_params
@@ -150,6 +139,7 @@ class QuantumCircuitFunction(torch.autograd.Function):
         qc = HEA({"params": params_np, "edges": edges, "edge_data": edge_data, "node_feats": node_feats}, n, d)
         energy, state = Energy(qc, edges, edge_data, node_feats, compute_state)
 
+        # SKQD uses the constructed circuit in the downstream sampling step.
         return torch.tensor(energy, dtype=params.dtype), torch.tensor(state, dtype=torch.complex128), qc
 
     @staticmethod
@@ -174,14 +164,12 @@ class NN_MERA_Model(torch.nn.Module):
         self.n = n
         self.d = d
 
-        # MERA에 필요한 파라미터 수 계산
+        # Compute the number of parameters required by MERA
         _, idx = HEA({"params": np.zeros(1000), "edges": None,
             "edge_data": None, "node_feats":None}, n, d, param_num=True)
         self.idx = idx
 
-        # 신경망 레이어 정의
-        # self.input_layer = torch.nn.Linear(1, 20)  # 입력 차원은 상황에 따라 조정
-        # torch.nn.init.normal_(self.input_layer.weight, mean=0.0, std=stddev)
+        # Define neural network layers
         self.hidden_layer1 = torch.nn.Linear(latent_size, NN_shape)
         torch.nn.init.normal_(self.hidden_layer1.weight, mean=0.0, std=stddev)
         
@@ -191,21 +179,20 @@ class NN_MERA_Model(torch.nn.Module):
         self.output_layer = torch.nn.Linear(NN_shape*2, self.idx)
         torch.nn.init.normal_(self.output_layer.weight, mean=0.0, std=stddev)
 
-        # 드롭아웃 레이어 정의
+        # Define dropout layer
         self.dropout = torch.nn.Dropout(p=dropout_rate)
 
     def forward(self,edges, edge_data, node_feats, latent_vector, compute_state=False):
         """
-        latent_vector: shape (batch, t) 혹은 (t,) 형태의 텐서
+        latent_vector: tensor with shape (batch, t) or (t,)
         """
         
 
-        # (1) 배치 차원 처리 (예: batch=1로 가정)
-        #     여기서는 간단히 [t] -> [1,t] 형태 맞추거나, 이미 [B,t]이면 그대로 사용
+        # (1) Handle batch dimension (e.g., assume batch=1)
+        #     Convert [t] to [1, t] if needed; keep [B, t] as is
         if latent_vector.dim() == 1:
             latent_vector = latent_vector.unsqueeze(0)  # [t] -> [1, t]
-        # print(latent_vector)
-        # (2) 신경망 통과
+        # (2) Pass through neural network
         x = self.hidden_layer1(latent_vector)
         x = torch.relu(x)
         x = self.hidden_layer2(x)
@@ -214,16 +201,16 @@ class NN_MERA_Model(torch.nn.Module):
 
         x = self.output_layer(x)
         x = torch.sigmoid(x)
-        # (3) 파라미터 스케일링
-        params = x * 6.3  # 원하는 스케일로 조정
+        # (3) Scale parameters
+        params = x * 6.3  # adjust to the desired scale
 
-        # (4) 배치 여러 개라면 loop / mean / sum 등의 처리 필요
-        #     여기서는 batch=1 가정 -> (1, num_params) -> (num_params,)
+        # (4) If multiple batch items are present, handle them with loop/mean/sum as needed
+        #     Assume batch=1 here: (1, num_params) -> (num_params,)
         params = params.view(-1)
 
-        # (5) Custom Autograd Function을 사용해 에너지 계산
+        # (5) Compute energy with a custom autograd function
+        # Unlike the standard release model, the SKQD version also returns the circuit.
         energy, state, circuit = QuantumCircuitFunction.apply(params, edges, edge_data,node_feats, self.n, self.d, compute_state)
-        # print(state)
         return energy, state, circuit
 
   

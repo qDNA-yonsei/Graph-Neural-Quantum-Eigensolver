@@ -6,7 +6,7 @@ import numpy as np
 import random
 import time
 
-# 시드 고정 (재현성 확보)
+# Fix seeds for reproducibility
 torch.manual_seed(1)
 np.random.seed(1)
 random.seed(1)
@@ -17,24 +17,16 @@ def one_hot_encoding_nodes(N=5):
     
     return torch.tensor(eye)  # shape (N, N)
 
-# def one_vec_encoding(N=5):
-#     return torch.tensor(np.ones((N,N), dtype=np.float32))
-
-# def binary_encoding_nodes(N):
-#     num_bits = (N - 1).bit_length() # N개의 노드를 표현할 최소한의 비트 수 결정
-#     node_feats = [list(map(int, format(i, f'0{num_bits}b'))) for i in range(N)]
-#     return torch.tensor(node_feats, dtype=torch.float)
-
 
 # ---------------------------------------------------------
-# 2. EGATLayer (Node Module + Edge Module) (Node Module에 논문의 λ 적용)
+# 2. EGATLayer (Node Module + Edge Module)
 # ---------------------------------------------------------
 class EGATLayer(nn.Module):
     def __init__(self,
-                 node_in_dim,    # 입력 노드 차원
-                 edge_in_dim,    # 입력 엣지 차원
-                 node_out_dim,   # 출력 노드 차원
-                 edge_out_dim,   # 출력 엣지 차원
+                 node_in_dim,    # input node dimension
+                 edge_in_dim,    # input edge dimension
+                 node_out_dim,   # output node dimension
+                 edge_out_dim,   # output edge dimension
                  lambda_param=0.5,
                  hidden_dim_node_att=16,
                  hidden_dim_edge_att=16,
@@ -47,39 +39,36 @@ class EGATLayer(nn.Module):
         self.edge_out_dim = edge_out_dim
         self.lambda_param = lambda_param
         
-        # --- λ를 통해 노드 부분(F'_H) & 엣지 부분(F'_E) 차원원 결정 ---
-        # 예) node_out_dim=16, lambda=0.7 => F'_H=11, F'_E=5
+        # --- Use lambda to split dimensions into node part (F'_H) and edge part (F'_E) ---
+        # Example: node_out_dim=16, lambda=0.7 => F'_H=11, F'_E=5
         F_H = int(self.lambda_param * self.node_out_dim)
         F_H = min(F_H, self.node_out_dim)  # just for safety
         F_E = self.node_out_dim - F_H
 
-        self.F_H = F_H  # 노드 부분 차원
-        self.F_E = F_E  # 엣지 부분 차원
-        # print(F_H)
-        # print(F_E)
+        self.F_H = F_H  # node-part dimension
+        self.F_E = F_E  # edge-part dimension
         # F'_H + F'_E = node_out_dim
 
         # --- Node Module ---
         # Wh: node_in_dim -> F_H
         # We: edge_in_dim -> F_E
-        self.W_node_h = nn.Linear(node_in_dim, F_H, bias=False)  # 노드 파트
-        self.W_node_e = nn.Linear(edge_in_dim, F_E, bias=False)  # 엣지 파트
+        self.W_node_h = nn.Linear(node_in_dim, F_H, bias=False)  # node part
+        self.W_node_e = nn.Linear(edge_in_dim, F_E, bias=False)  # edge part
 
-        # 주의: Attention 계산에서 [Wh_i, Wh_j, We_ij]가
+        # Note: in attention computation, [Wh_i, Wh_j, We_ij]
         #      dimension = F_H + F_H + F_E = (2F_H + F_E)
         #      = F_H + (F_H + F_E) = F_H + node_out_dim
         self.att_mlp_node = nn.Sequential(
             nn.Linear(F_H + F_H + F_E, hidden_dim_node_att),
-            nn.LeakyReLU(), # 기울기 설정 가능 default 0.01
+            nn.LeakyReLU(), # configurable slope, default 0.01
             nn.Linear(hidden_dim_node_att, hidden_dim_node_att//4),
             nn.LeakyReLU(),
             nn.Linear(hidden_dim_node_att//4, 1, bias=False)
         )
 
         # --- Edge Module ---
-        # (논문 (7)~(9))은 기존과 동일
-        #  여기서는 λ를 적용하지 않고, node_out_dim 전체를 사용
-        self.W_h_edge = nn.Linear(node_out_dim, node_out_dim//2, bias=False) # 어텐션을 구할 때는 edge의 영향을 높이기 위해 임의로 node dimension을 낮춤
+        #  Do not apply lambda here; use the full node_out_dim
+        self.W_h_edge = nn.Linear(node_out_dim, node_out_dim//2, bias=False) # Reduce node dimension to emphasize edge effects in attention
         self.W_e_edge = nn.Linear(edge_in_dim, node_out_dim, bias=False)
 
         self.att_mlp_edge = nn.Sequential(
@@ -89,7 +78,6 @@ class EGATLayer(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(hidden_dim_edge_att//2, 1, bias=False)
         )
-        # self.reset_parameters()   # ← 한 줄 호출
         in_dim_for_edge_mlp = (node_out_dim*2    # h_i, h_j
                                + node_out_dim*2  # e'_i, e'_j
                                + edge_in_dim)     # e_orig
@@ -102,8 +90,8 @@ class EGATLayer(nn.Module):
         )
     def reset_parameters(self):
             """
-            LeakyReLU(+Kaiming) 초기화를 모든 Linear에 적용.
-            bias는 0으로.
+            Apply LeakyReLU/Kaiming initialization to all Linear layers.
+            Set bias to zero.
             """
             for m in self.modules():
                 if isinstance(m, nn.Linear):
@@ -118,14 +106,14 @@ class EGATLayer(nn.Module):
         N = H_in.size(0)
         M = len(edges)
 
-        # 인접 리스트
+        # adjacency list
         adjacency = [[] for _ in range(N)]
         for k, (i, j) in enumerate(edges):
             adjacency[i].append((j, k))
             adjacency[j].append((i, k))
 
         # -------------------------------------------------
-        # [Node Module] (식(2)~(5) + λ 분할)
+        # [Node Module] 
         # -------------------------------------------------
         Wh = self.W_node_h(H_in) # Wh(h): (N, F_H)
         We = self.W_node_e(E_in) # We(e): (M, F_E)
@@ -138,7 +126,7 @@ class EGATLayer(nn.Module):
         for i in range(N):
             neighbors = adjacency[i]
             if len(neighbors) == 0:
-                # 고립 노드의 경우, [Wh_i, 0] 형태로 채움
+                # For isolated nodes, fill with [Wh_i, 0].
                 #   Wh_i.shape=(F_H), 0.shape=(F_E)
                 Wh_i = Wh[i]
                 pad_e = torch.zeros(self.F_E, device=device)
@@ -161,9 +149,6 @@ class EGATLayer(nn.Module):
                 # aggregator => [Wh_j || We_ij] => (F_H + F_E) => node_out_dim
                 neighbor_feats.append(torch.cat([Wh_j, We_ij], dim=-1))
 
-            # scores = torch.stack(scores, dim=0)  # (num_neighbors,1)
-            # alpha = F.softmax(scores, dim=0)     # (num_neighbors,1)
-            
             if len(scores) > 0:
                 scores = torch.stack(scores, dim=0)  # (num_neighbors,1)
                 alpha = F.softmax(scores, dim=0)     # (num_neighbors,1)
@@ -179,7 +164,7 @@ class EGATLayer(nn.Module):
             H_out[i] = h_new_i
 
         # -------------------------------------------------
-        # [Edge Module] (식(7)~(9) - λ는 적용 안 함)
+        # [Edge Module]
         # -------------------------------------------------
         Wh_edge = self.W_h_edge(H_out)  # (N, node_out_dim//2)
         We_edge = self.W_e_edge(E_in)   # (M, node_out_dim)
@@ -217,17 +202,15 @@ class EGATLayer(nn.Module):
             x_ij = torch.cat([hi, hj, ei_agg, ej_agg, e_orig], dim=-1)
             e_ij_new = self.edge_up_mlp(x_ij)
             E_out_list.append(e_ij_new)
-        # E_out = torch.stack(E_out_list, dim=0)
         if len(E_out_list) > 0:
             E_out = torch.stack(E_out_list, dim=0)
         else:
             print("warning!!!")
         return H_out, E_out
-# ----------------------- 여기까진 확인
 
 # ---------------------------------------------------------
 # 3. MultiLayerEGATEncoder:
-#    - Bottleneck -> L개의 EGATLayer -> Merge Layer
+#    - Bottleneck -> L EGATLayer -> Merge Layer
 # ---------------------------------------------------------
 class MultiLayerEGATEncoder(nn.Module):
 
@@ -240,11 +223,6 @@ class MultiLayerEGATEncoder(nn.Module):
                 lambda_param: float = 0.5):
         super().__init__()
         
-
-        # Bottleneck
-        # self.bottleneck_node = nn.Linear(node_in_dim, node_hidden_dim)
-        # self.bottleneck_edge = nn.Linear(edge_in_dim, edge_hidden_dim)
-
         # Stacked EGAT Layers
         self.egat_layers = nn.ModuleList(
             [
@@ -274,17 +252,15 @@ class MultiLayerEGATEncoder(nn.Module):
             H_list.append(H)
             E_list.append(E)
 
-        # 3) layer‑wise 평균 (GAT‑v2 안정화 trick)
+        # 3) Layer-wise averaging (GAT-v2 stabilization trick)
         H_final = torch.mean(torch.stack(H_list), dim=0)
         E_final = torch.mean(torch.stack(E_list), dim=0)
-        # H_final = H_list[-1]
-        # E_final = E_list[-1]
         return H_final, E_final
     
 # ---------------------------------------------------------
 # 4. EGATEAutoEncoder:
 #    - Encoder: MultiLayerEGATEncoder
-#    - Decoder: graph latent -> edge feature 재구성
+#    - Decoder: graph latent -> edge feature reconstruction
 # ---------------------------------------------------------
 class EGATEAutoEncoder(nn.Module):
     def __init__(self,
@@ -307,24 +283,15 @@ class EGATEAutoEncoder(nn.Module):
                                             num_layers,
                                             lambda_param
                                             )
-        # self.node_hidden_dim = node_hidden_dim
-        # self.edge_hidden_dim = edge_hidden_dim
         self.node_final_dim = node_hidden_dim
         self.edge_final_dim = edge_hidden_dim
 
-        # 본 예시에서는 그래프에 있는 edge 수(M)가 고정이라고 가정
-        # (N=5개의 노드 -> 해밀토니안 사이클 = 5개의 에지) 
-        # 따라서 디코더는 "graph_latent -> (M * edge_in_dim)" 형태로 매핑하는 구조로 둠.
-        
-        # num_nodes = 4 #######################################################
         self.num_edges = num_edges
         self.edge_in_dim = edge_in_dim
         self.num_nodes = node_in_dim
-        # self.latent_dim = latent_dim
         self.node_hidden_dim = node_hidden_dim
         self.edge_hidden_dim  = edge_hidden_dim
         self._reduce = nn.Linear(num_layers*(node_in_dim * node_hidden_dim + num_edges * edge_hidden_dim), latent_dim)
-        # self._expand = nn.Linear(latent_dim, num_nodes * node_hidden_dim + num_edges * edge_hidden_dim)
 
 
         self.decoder = nn.Sequential(
@@ -335,7 +302,6 @@ class EGATEAutoEncoder(nn.Module):
 
     def forward(self, H_in, E_in, edges):
         # encode
-        # print(E_in)
 
         N, M = H_in.size(0), E_in.size(0)
         H_final, E_final = self.encoder(H_in, E_in, edges)
@@ -353,15 +319,14 @@ class EGATEAutoEncoder(nn.Module):
 
         # 3) decode edges
           # shape: [M * edge_hidden_dim]
-        # E_out = self.edge_decoder(E_lat)  # [M * edge_in_dim]
         E_rec = E_out.view(self.num_edges, -1)  # → (M, edge_in_dim)
 
         return H_rec, E_rec, graph_latent
     
     def get_graph_latent(self, H_final, E_final):
         """
-        그래프 전체 임베딩:
-        노드 임베딩, 엣지 임베딩을 각각 평균 pooling한 뒤 concat
+        Graph-level embedding:
+        Mean-pool node and edge embeddings separately, then concatenate.
         """
         # node_pool = H_final.sum(dim=0)
         # edge_pool = E_final.sum(dim=0)
@@ -372,7 +337,7 @@ class EGATEAutoEncoder(nn.Module):
 
 
 # ---------------------------------------------------------
-# 5. 학습 루틴/테스트
+# 5. training routine / test
 # ---------------------------------------------------------
 def train_multi_graph(model, num_data, edges, edge_full_data, node_feats, 
                       num_epochs=100, lr=0.001,
@@ -388,17 +353,16 @@ def train_multi_graph(model, num_data, edges, edge_full_data, node_feats,
     mse_list_per_epoch = []
     H_mse_list = []
     E_mse_list = []
-    # print(node_feats.size(0))
     N, M = node_feats.size(0), len(edges)
-    a = 1.0 / N          # 노드 평균화
+    a = 1.0 / N          # node averaging
     b  = 1.0 / M    
     for epoch in range(num_epochs):
         total_loss = 0.0
         total_E_loss = 0.0
         total_H_loss = 0.0
         for i in range(num_data):
-        # --- 각 그래프마다 순차적으로 Forward → Loss → Backprop → Step ---                
-            # 1) Edge Feature 텐서 만들기
+        # --- Run Forward -> Loss -> Backprop -> Step sequentially for each graph ---                
+            # 1) Build edge feature tensor
             edge_feats_dict= edge_full_data[i]
             E_in_list = [edge_feats_dict[e] for e in edges]
             E_in = torch.stack(E_in_list, dim=0)  # (num_edges, edge_feat_dim)
@@ -406,27 +370,20 @@ def train_multi_graph(model, num_data, edges, edge_full_data, node_feats,
             # 2) Forward
             H_rec, E_rec, latent = model(node_feats, E_in, edges)
 
-                # 3) Loss 계산
+                # 3) Compute loss
             E_loss = mse(E_rec, E_in)
             H_loss = mse(H_rec, node_feats)
             loss = E_loss+H_loss
             
-            # 4) 역전파 및 모델 파라미터 업데이트
+            # 4) Backpropagate and update model parameters
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_E_loss += E_loss.item()
             total_H_loss += H_loss.item()
-            total_loss += loss.item()
-        #     total_loss += loss.item()
-        # if 31<epoch < 51:
-        #     scheduler.step() 
-        # optimizer.zero_grad()
-        # total_loss.backward()
-        # optimizer.step()
-            
+            total_loss += loss.item()            
 
-            # 모든 그래프에 대해 1번씩 학습을 마치면 → 이것이 1 epoch
+            # One pass over all graphs corresponds to one epoch
         avg_loss = total_loss / num_data
         if avg_loss < stop_threshold:
             print(f"Early stopped at epoch={epoch} with MSE={avg_loss}")
@@ -437,7 +394,7 @@ def train_multi_graph(model, num_data, edges, edge_full_data, node_feats,
         if epoch%10 == 0 :
             print(f"[Epoch {epoch+1}/{num_epochs}] Loss={avg_loss:.4f}")
 
-    # 학습 끝난 뒤, 각 그래프별 최종 Latent 추출
+    # Extract final latent vectors for each graph after training
     latents = []
     E_rec = []
     H_rec = []
@@ -446,54 +403,9 @@ def train_multi_graph(model, num_data, edges, edge_full_data, node_feats,
             edge_feats_dict= edge_full_data[i]
             E_in_list = [edge_feats_dict[e] for e in edges]
             E_in = torch.stack(E_in_list, dim=0)
-            # print(E_in)
             H_re, E_re, latent = model(node_feats, E_in, edges)
             latents.append(latent)
             H_rec.append(H_re)
             E_rec.append(E_re)
     return latents, mse_list_per_epoch, H_rec, E_rec, H_mse_list, E_mse_list
 
-
-
-
-
-
-
-
-
-
-
-def train_single_graph(model, edges, edge_feats_dict, node_feats, num_epochs: int = 1000,
-    alpha: float = 1.0, beta: float = 1.0, stop_threshold=1e-12  # 노드 재구성 가중치
-):
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    mse = nn.MSELoss()
-    mse_list = []
-   
-    E_in = torch.stack([edge_feats_dict[e] for e in edges])
-
-    for epoch in range(num_epochs):
-        H_rec, E_rec, graph_latent = model(node_feats, E_in, edges)
-        node_loss = mse(H_rec, node_feats)
-        edge_loss = mse(E_rec, E_in)
-
-        loss = alpha * node_loss + beta * edge_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        current_mse = loss.item()
-
-        mse_list.append(current_mse)
-
-        if current_mse < stop_threshold:
-            print(f"Early stopped at epoch={epoch} with MSE={current_mse}")
-            break
-
-    with torch.no_grad():
-        H_rec, E_rec, graph_latent = model(node_feats, E_in, edges)
-        # final_mse = criterion(E_rec, E_in).item()
-       
-    return H_rec, E_rec, mse_list, graph_latent
-    

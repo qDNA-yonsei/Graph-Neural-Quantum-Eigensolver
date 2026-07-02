@@ -3,8 +3,8 @@
 Paper mapping: 3x3 2D XXZ generalization experiment.
 
 Run order:
-1. `analytic.ipynb`
-2. `gae_data.ipynb`
+1. `egate_data.ipynb`
+2. `analytic_9qubit.ipynb`
 3. `nnvqe_*.ipynb` and `egate_nnvqe_*.ipynb`
 4. `random_parameter_test.ipynb` for the appendix random parameter baseline table
 
